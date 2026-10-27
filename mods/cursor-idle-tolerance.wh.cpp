@@ -2,7 +2,7 @@
 // @id              cursor-idle-tolerance
 // @name            Cursor Auto-Hide with Movement Tolerance
 // @description     Hide Windows system cursors after mouse inactivity; reveal by movement, mouse-button or wheel input, with recovery safeguards
-// @version         1.0.3
+// @version         1.0.4
 // @author          xcloudx01
 // @github          https://github.com/xcloudx01
 // @license         GPL-3.0-or-later
@@ -29,6 +29,10 @@ not a per-application overlay.
 - The cursor is hidden after the configured inactivity delay.
 - Once hidden, it reappears when its physical screen position moves **farther
   than** the configured distance from where it was hidden.
+- As a non-disableable safety fallback, it also reappears after **100 physical
+  pixels of cumulative pointer travel**, even if the movement ends back where
+  it started. A separate **512 raw-device-unit** fallback covers relative-input
+  mice while the pointer is locked or repeatedly recentered by a game.
 - Mouse buttons and the mouse wheel reveal it without needing pointer movement.
 - Keyboard input alone does not reset the timer or reveal the cursor (except
   for the emergency restore shortcut).
@@ -41,21 +45,29 @@ not a per-application overlay.
 - **Reveal distance (physical pixels):** Default **8**, allowed range 0 to 500.
   Distance is measured from the position at which the cursor was hidden; it
   is not a per-event movement threshold. Setting zero reveals on any detected
-  position change.
+  position change. **Above 100**, the cumulative movement safety fallback can
+  reveal the cursor before the configured displacement is reached.
+- **Extra emergency function key:** Default **0** (disabled). Set 1 to 11 for
+  another shortcut **Ctrl+Alt+Shift+F1** through **Ctrl+Alt+Shift+F11**. The
+  built-in Ctrl+Alt+Shift+F12 shortcut is always retained (where available).
 
 ## Compatibility
 
 This mod replaces Windows-provided system cursor shapes. It **cannot guarantee
 hiding** cursors drawn by applications themselves, including custom game
 cursors. Some games lock or recenter the pointer, so position-based revealing
-may not work as expected while they capture mouse input.
+may not work as expected while they capture mouse input. Raw relative mouse
+movement can still reveal the Windows cursor after sufficient raw device travel,
+but it cannot force an application-drawn game cursor to appear or disappear.
 
 ## Recovery
 
-Press **Ctrl+Alt+Shift+F12** for an emergency restore. After that, the cursor
-stays visible until the next detected mouse movement or mouse-button/wheel
-activity; ordinary auto-hide then resumes. The shortcut only works if Windows
-allows the mod to register it, and it cannot operate on the secure desktop.
+Press **Ctrl+Alt+Shift+F12** for an emergency restore, or use the configured
+additional shortcut. After that, the cursor stays visible until the next
+detected mouse movement or mouse-button/wheel activity; ordinary auto-hide then
+resumes. A registered emergency shortcut is required for hiding: if Windows
+rejects both shortcut registrations, the mod leaves the cursor visible. These
+shortcuts cannot operate on the secure desktop.
 
 Stopping or disabling the mod attempts to restore the currently configured
 Windows cursor scheme. An independent launcher also attempts recovery if the
@@ -80,9 +92,20 @@ The mod does not intentionally modify saved cursor-scheme registry settings.
   $description: >-
     Distance from the hidden position needed to reveal the cursor.
     Set 0 to reveal on any detected position change. Mouse-button
-    and wheel input always reveal. Allowed range: 0 to 500.
+    and wheel input always reveal. Above 100 px, the automatic
+    100-pixel cumulative-travel safety limit can reveal it sooner.
+    Allowed range: 0 to 500.
   #! $min: 0
   #! $max: 500
+- extraRescueFunctionKey: 0
+  $name: Additional emergency shortcut (function key)
+  $description: >-
+    0 = disabled (default). 1-11 = Ctrl+Alt+Shift+F1 through
+    Ctrl+Alt+Shift+F11. The original Ctrl+Alt+Shift+F12 recovery
+    shortcut always remains active when Windows permits registration.
+    If neither shortcut registers, the mod refuses to hide cursors.
+  #! $min: 0
+  #! $max: 11
 */
 // ==/WindhawkModSettings==
 
@@ -91,6 +114,7 @@ The mod does not intentionally modify saved cursor-scheme registry settings.
 #include <shellapi.h>
 #include <atomic>
 #include <cstdint>
+#include <cmath>
 #include <cwchar>
 #include <vector>
 // Embedded so this source can be pasted into Windhawk as ONE file.
@@ -100,6 +124,10 @@ The mod does not intentionally modify saved cursor-scheme registry settings.
 namespace cursor_idle {
 
 enum class Action { None, Hide, Restore };
+
+// Safety limits are intentionally not user-configurable.
+static constexpr double kMaxCumulativePhysicalPx = 100.0;
+static constexpr std::uint64_t kMaxCumulativeRawUnits = 512;
 
 struct Settings {
     std::uint64_t idleMs = 1000;
@@ -114,6 +142,8 @@ struct Input {
     bool mouseButtonOrWheel = false;
     bool mouseButtonHeld = false;
     bool emergencyRestore = false;
+    bool rescueAvailable = true;
+    std::uint64_t rawMotionUnits = 0;
 };
 
 struct State {
@@ -124,6 +154,8 @@ struct State {
     std::int64_t lastY = 0;
     std::int64_t hideX = 0;
     std::int64_t hideY = 0;
+    double cumulativePhysicalPx = 0.0;
+    std::uint64_t cumulativeRawUnits = 0;
     std::uint64_t lastActivity = 0;
 };
 
@@ -145,9 +177,28 @@ inline Action Step(State& s, const Settings& cfg, const Input& in) {
         s.lastActivity = in.now;
     }
 
-    const bool moved = in.x != s.lastX || in.y != s.lastY;
+    const long double stepX = (long double)in.x - (long double)s.lastX;
+    const long double stepY = (long double)in.y - (long double)s.lastY;
+    const bool moved = stepX != 0 || stepY != 0;
+    // Add each observed segment, not the net distance from the hide point.
+    // Also count unaccelerated raw mouse motion for captured/recentered cursors.
+    if (s.hidden) {
+        s.cumulativePhysicalPx += (double)std::sqrt(stepX * stepX + stepY * stepY);
+        const auto remaining = kMaxCumulativeRawUnits > s.cumulativeRawUnits
+            ? kMaxCumulativeRawUnits - s.cumulativeRawUnits : 0;
+        s.cumulativeRawUnits += in.rawMotionUnits > remaining ? remaining : in.rawMotionUnits;
+    }
     s.lastX = in.x;
     s.lastY = in.y;
+
+    // No recoverable global hotkey: never leave the system cursors hidden.
+    if (!in.rescueAvailable) {
+        const bool wasHidden = s.hidden;
+        s.hidden = false;
+        s.suspended = true;
+        s.lastActivity = in.now;
+        return wasHidden ? Action::Restore : Action::None;
+    }
 
     if (in.emergencyRestore) {
         const bool wasHidden = s.hidden;
@@ -172,14 +223,16 @@ inline Action Step(State& s, const Settings& cfg, const Input& in) {
         const long double dx = (long double)in.x - (long double)s.hideX;
         const long double dy = (long double)in.y - (long double)s.hideY;
         const long double t = (long double)cfg.tolerancePx;
-        if (dx * dx + dy * dy > t * t) {
+        if (dx * dx + dy * dy > t * t ||
+            s.cumulativePhysicalPx >= kMaxCumulativePhysicalPx ||
+            s.cumulativeRawUnits >= kMaxCumulativeRawUnits) {
             s.hidden = false;
             s.lastActivity = in.now;
             return Action::Restore;
         }
     }
 
-    if (moved) {
+    if (moved || in.rawMotionUnits != 0) {
         if (s.suspended) s.suspended = false;
         if (!s.hidden) s.lastActivity = in.now;
     }
@@ -197,6 +250,8 @@ inline Action Step(State& s, const Settings& cfg, const Input& in) {
         s.hidden = true;
         s.hideX = in.x;
         s.hideY = in.y;
+        s.cumulativePhysicalPx = 0;
+        s.cumulativeRawUnits = 0;
         return Action::Hide;
     }
     return Action::None;
@@ -208,9 +263,11 @@ inline Action Step(State& s, const Settings& cfg, const Input& in) {
 static constexpr PCWSTR kModifiedKey = L"modifiedV1";
 static constexpr PCWSTR kOwnerPidKey = L"ownerPidV1";
 static constexpr int kRescueHotkeyId = 0x7341;
+static constexpr int kExtraRescueHotkeyId = 0x7342;
 
 static std::atomic<int> g_idleMilliseconds{1000};
 static std::atomic<int> g_tolerancePx{8};
+static std::atomic<int> g_extraRescueFunctionKey{0};
 static HANDLE g_workerStop = nullptr;
 static HANDLE g_workerThread = nullptr;
 static LPTOP_LEVEL_EXCEPTION_FILTER g_prevExceptionHandler = nullptr;
@@ -225,6 +282,7 @@ static const DWORD kCursorIds[] = {
 static void ReadSettings() {
     int delayMs = Wh_GetIntSetting(L"idleMilliseconds");
     int tolerance = Wh_GetIntSetting(L"movementTolerancePx");
+    int rescueKey = Wh_GetIntSetting(L"extraRescueFunctionKey");
     // Windhawk 1.x ignores the #! $min/$max editor hints. Validate at runtime.
     // Older installations without a settings block may have saved zero;
     // interpret that invalid value as the documented 1000 ms default.
@@ -233,8 +291,13 @@ static void ReadSettings() {
     if (delayMs > 3600000) delayMs = 3600000;
     if (tolerance < 0) tolerance = 0;
     if (tolerance > 500) tolerance = 500;
+    if (rescueKey < 0 || rescueKey > 11) rescueKey = 0;
+    if (tolerance > 100) {
+        Wh_Log(L"Reveal distance %d px: 100 px cumulative and 512 raw-unit safety fallbacks remain enabled", tolerance);
+    }
     g_idleMilliseconds.store(delayMs);
     g_tolerancePx.store(tolerance);
+    g_extraRescueFunctionKey.store(rescueKey);
 }
 
 // Reloads the current user cursor scheme; never changes registry cursor values.
@@ -366,7 +429,8 @@ static bool OnCurrentInputDesktop() {
     return valid;
 }
 
-static bool ReadMouseEvents(MSG* msg, bool* hadButtonOrWheel) {
+static bool ReadMouseEvents(MSG* msg, bool* hadButtonOrWheel,
+                            std::uint64_t* rawMotionUnits) {
     if (msg->message != WM_INPUT) return false;
     UINT size = 0;
     if (GetRawInputData(reinterpret_cast<HRAWINPUT>(msg->lParam), RID_INPUT,
@@ -384,8 +448,26 @@ static bool ReadMouseEvents(MSG* msg, bool* hadButtonOrWheel) {
         return true;
     }
     RAWINPUT* raw = reinterpret_cast<RAWINPUT*>(buffer.data());
-    if (raw->header.dwType == RIM_TYPEMOUSE && raw->data.mouse.usButtonFlags) {
+    if (raw->header.dwType == RIM_TYPEMOUSE &&
+        size < sizeof(RAWINPUTHEADER) + sizeof(RAWMOUSE)) {
+        // A truncated mouse record cannot be trusted; reveal fail-open.
         *hadButtonOrWheel = true;
+        return true;
+    }
+    if (raw->header.dwType == RIM_TYPEMOUSE) {
+        if (raw->data.mouse.usButtonFlags) *hadButtonOrWheel = true;
+        // Absolute raw coordinates aren't physical movement deltas; only
+        // accumulate relative device counts. Screen positions still work.
+        if (!(raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+            const auto dx = (std::int64_t)raw->data.mouse.lLastX;
+            const auto dy = (std::int64_t)raw->data.mouse.lLastY;
+            const auto ax = (std::uint64_t)(dx < 0 ? -dx : dx);
+            const auto ay = (std::uint64_t)(dy < 0 ? -dy : dy);
+            const auto motion = ax > ay ? ax : ay;
+            const auto left = cursor_idle::kMaxCumulativeRawUnits > *rawMotionUnits
+                ? cursor_idle::kMaxCumulativeRawUnits - *rawMotionUnits : 0;
+            *rawMotionUnits += motion > left ? left : motion;
+        }
     }
     return true;
 }
@@ -412,9 +494,12 @@ static DWORD WINAPI WorkerThread(LPVOID) {
                                             MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
                                             VK_F12) != 0;
     if (!rescueRegistered) {
-        Wh_Log(L"Emergency shortcut unavailable: %lu", GetLastError());
+        Wh_Log(L"Built-in emergency shortcut unavailable: %lu", GetLastError());
     }
-
+    // The built-in F12 rescue can never be disabled by settings. An optional
+    // alternative F1-F11 can be registered alongside it.
+    int attemptedExtraKey = -1;
+    bool extraRescueRegistered = false;
     g_state.lastActivity = GetTickCount64();
     for (;;) {
         DWORD waitMs = g_state.hidden ? 20 : 80;
@@ -431,14 +516,40 @@ static DWORD WINAPI WorkerThread(LPVOID) {
                                               waitMs, QS_ALLINPUT);
         if (wait == WAIT_OBJECT_0 || wait == WAIT_FAILED) break;
 
+        const int wantedExtra = g_extraRescueFunctionKey.load();
+        if (wantedExtra != attemptedExtraKey) {
+            if (extraRescueRegistered) {
+                UnregisterHotKey(window, kExtraRescueHotkeyId);
+                extraRescueRegistered = false;
+            }
+            attemptedExtraKey = wantedExtra;
+            if (wantedExtra >= 1 && wantedExtra <= 11) {
+                extraRescueRegistered = RegisterHotKey(
+                    window, kExtraRescueHotkeyId,
+                    MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+                    VK_F1 + wantedExtra - 1) != 0;
+                if (!extraRescueRegistered) {
+                    Wh_Log(L"Additional rescue F%d registration failed: %lu",
+                           wantedExtra, GetLastError());
+                }
+            }
+        }
+
         bool clickedOrScrolled = false;
+        std::uint64_t rawMotionUnits = 0;
         bool emergency = false;
         MSG message{};
-        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        // Bound the batch so a high-polling-rate mouse cannot indefinitely
+        // postpone state updates, stop signals, or emergency restoration.
+        for (int count = 0;
+             count < 512 && PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE);
+             ++count) {
             if (message.message == WM_INPUT) {
-                ReadMouseEvents(&message, &clickedOrScrolled);
+                ReadMouseEvents(&message, &clickedOrScrolled, &rawMotionUnits);
             }
-            if (message.message == WM_HOTKEY && message.wParam == kRescueHotkeyId) {
+            if (message.message == WM_HOTKEY &&
+                (message.wParam == kRescueHotkeyId ||
+                 message.wParam == kExtraRescueHotkeyId)) {
                 emergency = true;
             }
             TranslateMessage(&message);
@@ -455,6 +566,8 @@ static DWORD WINAPI WorkerThread(LPVOID) {
         in.mouseButtonOrWheel = clickedOrScrolled;
         in.mouseButtonHeld = MouseHeld();
         in.emergencyRestore = emergency;
+        in.rescueAvailable = rescueRegistered || extraRescueRegistered;
+        in.rawMotionUnits = rawMotionUnits;
 
         cursor_idle::Settings settings{};
         settings.idleMs = (std::uint64_t)g_idleMilliseconds.load();
@@ -477,6 +590,7 @@ static DWORD WINAPI WorkerThread(LPVOID) {
         }
     }
     if (rescueRegistered) UnregisterHotKey(window, kRescueHotkeyId);
+    if (extraRescueRegistered) UnregisterHotKey(window, kExtraRescueHotkeyId);
     RAWINPUTDEVICE removeDevice = dev;
     removeDevice.dwFlags = RIDEV_REMOVE;
     removeDevice.hwndTarget = nullptr;
